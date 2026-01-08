@@ -14,6 +14,64 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Server missing TMB credentials" })
     }
 
+    const parseMinutes = (d) => {
+      const raw =
+        d?.t_in_min ??
+        d?.["t-in-min"] ??
+        d?.t_in_minute ??
+        d?.["t-in-minute"] ??
+        d?.minutes ??
+        d?.["minutes"]
+      const n = Number(raw)
+      return Number.isFinite(n) ? n : null
+    }
+
+    const normalizeIbusArray = (payload) => {
+      const ibus =
+        payload?.data?.ibus ??
+        payload?.data?.["ibus"] ??
+        payload?.data?.["iBus"] ??
+        payload?.data?.["i-bus"] ??
+        payload?.ibus ??
+        []
+      return Array.isArray(ibus) ? ibus : []
+    }
+
+    const groupByLineTwoTimes = (items, maxLines) => {
+      const map = new Map()
+
+      for (const d of items) {
+        const line = (d?.line || "").toString().trim()
+        const destination = (d?.destination || "").toString().trim()
+        const minutes = parseMinutes(d)
+
+        if (!line || !destination || minutes === null) continue
+
+        if (!map.has(line)) {
+          map.set(line, { line, destination, times: [] })
+        }
+
+        const entry = map.get(line)
+
+        entry.times.push(minutes)
+      }
+
+      const grouped = Array.from(map.values()).map((x) => {
+        const uniqSorted = Array.from(new Set(x.times)).sort((a, b) => a - b)
+        const m1 = uniqSorted.length > 0 ? uniqSorted[0] : null
+        const m2 = uniqSorted.length > 1 ? uniqSorted[1] : null
+        return { line: x.line, destination: x.destination, m1, m2 }
+      })
+
+      grouped.sort((a, b) => {
+        const am = a.m1 ?? 9999
+        const bm = b.m1 ?? 9999
+        return am - bm
+      })
+
+      return grouped.slice(0, maxLines)
+    }
+
     const stopsToFetch = [stopId]
     if (secondaryStopId) stopsToFetch.push(secondaryStopId)
 
@@ -26,42 +84,15 @@ export default async function handler(req, res) {
         const r = await fetch(url.toString(), { headers: { accept: "application/json" } })
 
         if (!r.ok) {
-          return { stop_id: sid, error: `TMB error ${r.status}`, departures: [] }
+          return { stop_id: sid, error: `TMB error ${r.status}`, lines: [] }
         }
 
         const payload = await r.json()
+        const ibus = normalizeIbusArray(payload)
 
-        // TMB responses sometimes vary in shape, try a few paths
-        const ibus =
-          payload?.data?.ibus ??
-          payload?.data?.["ibus"] ??
-          payload?.data?.["iBus"] ??
-          payload?.data?.["i-bus"] ??
-          payload?.ibus ??
-          []
+        const lines = groupByLineTwoTimes(ibus, 10)
 
-        const departures = (Array.isArray(ibus) ? ibus : [])
-          .slice(0, 6)
-          .map((d) => {
-            const rawMinutes =
-              d?.t_in_min ??
-              d?.["t-in-min"] ??
-              d?.t_in_minute ??
-              d?.["t-in-minute"] ??
-              d?.minutes ??
-              d?.["minutes"]
-
-            const minutes = Number.isFinite(Number(rawMinutes)) ? Number(rawMinutes) : null
-
-            return {
-              line: (d?.line || "").toString(),
-              destination: (d?.destination || "").toString(),
-              minutes,
-            }
-          })
-          .filter((d) => d.line && d.destination)
-
-        return { stop_id: sid, departures }
+        return { stop_id: sid, lines }
       })
     )
 
@@ -72,7 +103,7 @@ export default async function handler(req, res) {
       updated_at: new Date().toISOString(),
       stops: results,
     })
-  } catch (e) {
+  } catch {
     return res.status(500).json({ error: "Unexpected error" })
   }
 }
