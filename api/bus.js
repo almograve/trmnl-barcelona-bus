@@ -78,7 +78,7 @@ export default async function handler(req, res) {
         })
         .filter((d) => d.line && d.destination && d.minutes !== null)
         .sort((a, b) => a.minutes - b.minutes)
-        .slice(0, 20)
+        .slice(0, 40)
 
       const lines = buildLinesFromDepartures(departures, 12)
 
