@@ -3,105 +3,68 @@ export default async function handler(req, res) {
     const stopId = (req.query.stop_id || "").toString().trim()
     const secondaryStopId = (req.query.secondary_stop_id || "").toString().trim()
 
-    if (!stopId) {
-      return res.status(400).json({ error: "Missing stop_id" })
-    }
+    if (!stopId) return res.status(400).json({ error: "Missing stop_id" })
 
-    const TMB_APP_ID = process.env.TMB_APP_ID
-    const TMB_APP_KEY = process.env.TMB_APP_KEY
+    const fetchStop = async (sid) => {
+      const url =
+        "https://www.tmb.cat/en/barcelona/tmb-ibus/next-bus" +
+        "?_buslineportlet_cmd=BUS_TIME_STOPS_AMB" +
+        "&_buslineportlet_groupId=20182" +
+        "&_buslineportlet_ibus=1" +
+        "&_buslineportlet_renderPage=view-bus-stop-line" +
+        `&_buslineportlet_stopName=${encodeURIComponent(sid)}` +
+        "&p_p_cacheability=cacheLevelPage" +
+        "&p_p_id=buslineportlet" +
+        "&p_p_lifecycle=2" +
+        "&p_p_mode=view" +
+        "&p_p_state=normal"
 
-    if (!TMB_APP_ID || !TMB_APP_KEY) {
-      return res.status(500).json({ error: "Server missing TMB credentials" })
-    }
+      const r = await fetch(url, { headers: { accept: "application/json" } })
+      if (!r.ok) return { stop_id: sid, lines: [], error: `TMB web feed ${r.status}` }
 
-    const parseMinutes = (d) => {
-      const raw =
-        d?.t_in_min ??
-        d?.["t-in-min"] ??
-        d?.t_in_minute ??
-        d?.["t-in-minute"] ??
-        d?.minutes ??
-        d?.["minutes"]
-      const n = Number(raw)
-      return Number.isFinite(n) ? n : null
-    }
+      const payload = await r.json()
+      const times = Array.isArray(payload?.times) ? payload.times : []
 
-    const normalizeIbusArray = (payload) => {
-      const ibus =
-        payload?.data?.ibus ??
-        payload?.data?.["ibus"] ??
-        payload?.data?.["iBus"] ??
-        payload?.data?.["i-bus"] ??
-        payload?.ibus ??
-        []
-      return Array.isArray(ibus) ? ibus : []
-    }
+      const byLine = new Map()
 
-    const groupByLineTwoTimes = (items, maxLines) => {
-      const map = new Map()
+      for (const t of times) {
+        const line = (t?.lineCode || "").toString().trim()
+        const destination = (t?.destination || "").toString().trim()
+        const arrivalSec = Number(t?.arrivalTime)
 
-      for (const d of items) {
-        const line = (d?.line || "").toString().trim()
-        const destination = (d?.destination || "").toString().trim()
-        const minutes = parseMinutes(d)
+        if (!line || !destination) continue
+        if (!Number.isFinite(arrivalSec)) continue
 
-        if (!line || !destination || minutes === null) continue
+        const minutes = Math.max(0, Math.round(arrivalSec / 60))
 
-        if (!map.has(line)) {
-          map.set(line, { line, destination, times: [] })
-        }
-
-        const entry = map.get(line)
-
-        entry.times.push(minutes)
+        if (!byLine.has(line)) byLine.set(line, { line, destination, mins: [] })
+        byLine.get(line).mins.push(minutes)
       }
 
-      const grouped = Array.from(map.values()).map((x) => {
-        const uniqSorted = Array.from(new Set(x.times)).sort((a, b) => a - b)
-        const m1 = uniqSorted.length > 0 ? uniqSorted[0] : null
-        const m2 = uniqSorted.length > 1 ? uniqSorted[1] : null
-        return { line: x.line, destination: x.destination, m1, m2 }
-      })
+      const lines = Array.from(byLine.values())
+        .map((x) => {
+          const uniqSorted = Array.from(new Set(x.mins)).sort((a, b) => a - b)
+          return {
+            line: x.line,
+            destination: x.destination,
+            m1: uniqSorted[0] ?? null,
+            m2: uniqSorted[1] ?? null,
+          }
+        })
+        .sort((a, b) => (a.m1 ?? 9999) - (b.m1 ?? 9999))
+        .slice(0, 12)
 
-      grouped.sort((a, b) => {
-        const am = a.m1 ?? 9999
-        const bm = b.m1 ?? 9999
-        return am - bm
-      })
-
-      return grouped.slice(0, maxLines)
+      return { stop_id: sid, lines }
     }
 
-    const stopsToFetch = [stopId]
-    if (secondaryStopId) stopsToFetch.push(secondaryStopId)
-
-    const results = await Promise.all(
-      stopsToFetch.map(async (sid) => {
-        const url = new URL(`https://api.tmb.cat/v1/ibus/stops/${encodeURIComponent(sid)}`)
-        url.searchParams.set("app_id", TMB_APP_ID)
-        url.searchParams.set("app_key", TMB_APP_KEY)
-
-        const r = await fetch(url.toString(), { headers: { accept: "application/json" } })
-
-        if (!r.ok) {
-          return { stop_id: sid, error: `TMB error ${r.status}`, lines: [] }
-        }
-
-        const payload = await r.json()
-        const ibus = normalizeIbusArray(payload)
-
-        const lines = groupByLineTwoTimes(ibus, 10)
-
-        return { stop_id: sid, lines }
-      })
-    )
+    const stops = [await fetchStop(stopId)]
+    if (secondaryStopId) stops.push(await fetchStop(secondaryStopId))
 
     res.setHeader("Cache-Control", "s-maxage=20, stale-while-revalidate=60")
-
     return res.status(200).json({
       title: "Barcelona buses",
       updated_at: new Date().toISOString(),
-      stops: results,
+      stops,
     })
   } catch {
     return res.status(500).json({ error: "Unexpected error" })
