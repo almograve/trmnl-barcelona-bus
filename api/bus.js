@@ -2,6 +2,8 @@ export default async function handler(req, res) {
   try {
     const stopId = (req.query.stop_id || "").toString().trim()
     const secondaryStopId = (req.query.secondary_stop_id || "").toString().trim()
+    const debug = (req.query.debug || "").toString().trim() === "1"
+    const prefer = (req.query.prefer || "").toString().trim() // "web" or "official"
 
     if (!stopId) {
       return res.status(400).json({ error: "Missing stop_id" })
@@ -9,7 +11,6 @@ export default async function handler(req, res) {
 
     const TMB_APP_ID = process.env.TMB_APP_ID
     const TMB_APP_KEY = process.env.TMB_APP_KEY
-
     const hasOfficialCreds = Boolean(TMB_APP_ID && TMB_APP_KEY)
 
     const uniqSorted = (arr) => Array.from(new Set(arr)).sort((a, b) => a - b)
@@ -59,29 +60,73 @@ export default async function handler(req, res) {
         "&p_p_mode=view" +
         "&p_p_state=normal"
 
-      const r = await fetch(url, { headers: { accept: "application/json" } })
-      if (!r.ok) {
-        return { ok: false, status: r.status, lines: [], debug: "web_feed_http_error" }
+      const headers = {
+        accept: "application/json,text/plain,*/*",
+        "accept-language": "en-GB,en;q=0.9,es;q=0.8,ca;q=0.7",
+        "user-agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        referer: `https://www.tmb.cat/en/barcelona/tmb-ibus/next-bus/-/lineabus/parada/${encodeURIComponent(sid)}`,
       }
 
-      const payload = await r.json()
-      const times = Array.isArray(payload?.times) ? payload.times : []
+      let text = ""
+      try {
+        const r = await fetch(url, { headers })
+        text = await r.text()
 
-      const rows = []
-      for (const t of times) {
-        const line = (t?.lineCode || "").toString().trim()
-        const destination = (t?.destination || "").toString().trim()
-        const arrivalSec = Number(t?.arrivalTime)
+        if (!r.ok) {
+          return {
+            ok: false,
+            status: r.status,
+            lines: [],
+            debug: { url, snippet: text.slice(0, 280) },
+          }
+        }
 
-        if (!line || !destination) continue
-        if (!Number.isFinite(arrivalSec)) continue
+        let payload = null
+        try {
+          payload = JSON.parse(text)
+        } catch {
+          return {
+            ok: false,
+            status: 200,
+            lines: [],
+            debug: { url, snippet: text.slice(0, 280), note: "not_json" },
+          }
+        }
 
-        const minutes = Math.max(0, Math.round(arrivalSec / 60))
-        rows.push({ line, destination, minutes })
+        const times = Array.isArray(payload?.times) ? payload.times : []
+
+        const rows = []
+        for (const t of times) {
+          const line = (t?.lineCode || "").toString().trim()
+          const destination = (t?.destination || "").toString().trim()
+          const arrivalSec = Number(t?.arrivalTime)
+
+          if (!line || !destination) continue
+          if (!Number.isFinite(arrivalSec)) continue
+
+          const minutes = Math.max(0, Math.round(arrivalSec / 60))
+          rows.push({ line, destination, minutes })
+        }
+
+        const lines = groupTimesByLine(rows, 12)
+
+        return {
+          ok: true,
+          status: 200,
+          lines,
+          debug: debug
+            ? { url, times_count: times.length, keys: payload ? Object.keys(payload).slice(0, 20) : [] }
+            : undefined,
+        }
+      } catch (e) {
+        return {
+          ok: false,
+          status: 0,
+          lines: [],
+          debug: { url, note: "fetch_failed", snippet: text.slice(0, 280) },
+        }
       }
-
-      const lines = groupTimesByLine(rows, 12)
-      return { ok: true, status: 200, lines, debug: "web_feed_ok" }
     }
 
     const parseOfficialMinutes = (d) => {
@@ -111,7 +156,7 @@ export default async function handler(req, res) {
 
     const fetchStopFromOfficialApi = async (sid) => {
       if (!hasOfficialCreds) {
-        return { ok: false, status: 500, lines: [], debug: "official_missing_creds" }
+        return { ok: false, status: 500, lines: [], debug: { note: "official_missing_creds" } }
       }
 
       const url = new URL(`https://api.tmb.cat/v1/ibus/stops/${encodeURIComponent(sid)}`)
@@ -120,7 +165,7 @@ export default async function handler(req, res) {
 
       const r = await fetch(url.toString(), { headers: { accept: "application/json" } })
       if (!r.ok) {
-        return { ok: false, status: r.status, lines: [], debug: "official_http_error" }
+        return { ok: false, status: r.status, lines: [], debug: debug ? { url: url.toString() } : undefined }
       }
 
       const payload = await r.json()
@@ -139,26 +184,36 @@ export default async function handler(req, res) {
       }
 
       const lines = groupTimesByLine(rows, 12)
-      return { ok: true, status: 200, lines, debug: "official_ok" }
+      return { ok: true, status: 200, lines }
     }
 
     const fetchStop = async (sid) => {
       const web = await fetchStopFromWebFeed(sid)
-      if (web.ok && web.lines.length > 0) {
-        return { stop_id: sid, lines: web.lines, source: "web" }
-      }
-
       const official = await fetchStopFromOfficialApi(sid)
-      if (official.ok && official.lines.length > 0) {
-        return { stop_id: sid, lines: official.lines, source: "official" }
+
+      const chooseWeb =
+        prefer === "web" ||
+        (prefer !== "official" && web.ok && web.lines.length > 0)
+
+      const chooseOfficial =
+        prefer === "official" ||
+        (prefer !== "web" && official.ok && official.lines.length > 0)
+
+      if (chooseWeb) {
+        return { stop_id: sid, lines: web.lines, source: "web", web_debug: debug ? web.debug : undefined }
       }
 
-      const error =
-        web.ok
-          ? "No upcoming buses"
-          : `Stop feed error ${web.status}`
+      if (chooseOfficial) {
+        return { stop_id: sid, lines: official.lines, source: "official", web_debug: debug ? web.debug : undefined }
+      }
 
-      return { stop_id: sid, lines: [], error, source: web.ok ? "web" : "web_error" }
+      return {
+        stop_id: sid,
+        lines: [],
+        error: "No upcoming buses",
+        source: "none",
+        web_debug: debug ? web.debug : undefined,
+      }
     }
 
     const stops = []
@@ -172,7 +227,7 @@ export default async function handler(req, res) {
       updated_at: new Date().toISOString(),
       stops,
     })
-  } catch (e) {
+  } catch {
     return res.status(500).json({ error: "Unexpected error" })
   }
 }
