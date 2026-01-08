@@ -3,10 +3,13 @@ export default async function handler(req, res) {
     const stopId = (req.query.stop_id || "").toString().trim()
     const secondaryStopId = (req.query.secondary_stop_id || "").toString().trim()
 
-    if (!stopId) return res.status(400).json({ error: "Missing stop_id" })
+    if (!stopId) {
+      return res.status(400).json({ error: "Missing stop_id" })
+    }
 
     const TMB_APP_ID = process.env.TMB_APP_ID
     const TMB_APP_KEY = process.env.TMB_APP_KEY
+
     if (!TMB_APP_ID || !TMB_APP_KEY) {
       return res.status(500).json({ error: "Server missing TMB credentials" })
     }
@@ -14,8 +17,11 @@ export default async function handler(req, res) {
     const nowMs = () => Date.now()
 
     const minutesUntil = (arrivalMs) => {
-      const diff = Math.round((Number(arrivalMs) - nowMs()) / 60000)
-      return Number.isFinite(diff) ? Math.max(0, diff) : null
+      const n = Number(arrivalMs)
+      if (!Number.isFinite(n)) return null
+      const diff = Math.round((n - nowMs()) / 60000)
+      if (!Number.isFinite(diff)) return null
+      return Math.max(0, diff)
     }
 
     const uniqSorted = (arr) => Array.from(new Set(arr)).sort((a, b) => a - b)
@@ -24,8 +30,12 @@ export default async function handler(req, res) {
       const byLine = new Map()
 
       for (const d of deps) {
-        if (!d.line || !d.destination || d.minutes === null) continue
-        if (!byLine.has(d.line)) byLine.set(d.line, { line: d.line, destination: d.destination, mins: [] })
+        if (!d.line || !d.destination) continue
+        if (d.minutes === null) continue
+
+        if (!byLine.has(d.line)) {
+          byLine.set(d.line, { line: d.line, destination: d.destination, mins: [] })
+        }
         byLine.get(d.line).mins.push(d.minutes)
       }
 
@@ -37,6 +47,7 @@ export default async function handler(req, res) {
             destination: x.destination,
             m1: mins[0] ?? null,
             m2: mins[1] ?? null,
+            all_times: mins,
           }
         })
         .sort((a, b) => (a.m1 ?? 9999) - (b.m1 ?? 9999))
@@ -51,16 +62,35 @@ export default async function handler(req, res) {
       url.searchParams.set("app_key", TMB_APP_KEY)
 
       const r = await fetch(url.toString(), { headers: { accept: "application/json" } })
-      if (!r.ok) return { stop_id: sid, error: `TMB error ${r.status}`, departures: [], lines: [] }
+      if (!r.ok) {
+        return {
+          stop_id: sid.toString(),
+          departures: [],
+          lines: [],
+          stop_detail: {
+            stop_id: sid.toString(),
+            name: null,
+            api_timestamp_ms: null,
+            ramp_ko_count: 0,
+            ramp_ko_examples: [],
+          },
+          error: `TMB error ${r.status}`,
+        }
+      }
 
       const payload = await r.json()
 
+      const apiTimestamp = Number(payload?.timestamp)
       const parades = Array.isArray(payload?.parades) ? payload.parades : []
-      const parada = parades.find((p) => (p?.codi_parada || "").toString() === sid.toString()) || parades[0]
+      const parada =
+        parades.find((p) => (p?.codi_parada || "").toString() === sid.toString()) || parades[0] || null
 
+      const stopName = (parada?.nom_parada || "").toString().trim() || null
       const linies = Array.isArray(parada?.linies_trajectes) ? parada.linies_trajectes : []
 
       const departures = []
+      const rampKO = []
+
       for (const lt of linies) {
         const line = (lt?.nom_linia || "").toString().trim()
         const destination = (lt?.desti_trajecte || "").toString().trim()
@@ -69,8 +99,15 @@ export default async function handler(req, res) {
         for (const b of buses) {
           const arrivalMs = b?.temps_arribada
           const minutes = minutesUntil(arrivalMs)
-          if (!line || !destination || minutes === null) continue
-          departures.push({ line, destination, minutes })
+
+          if (line && destination && minutes !== null) {
+            departures.push({ line, destination, minutes })
+          }
+
+          const ramp = b?.info_bus?.accessibilitat?.estat_rampa
+          if (ramp === "KO") {
+            rampKO.push({ line, destination })
+          }
         }
       }
 
@@ -78,10 +115,24 @@ export default async function handler(req, res) {
 
       const lines = buildLinesFromDepartures(departures, 12)
 
-      return { stop_id: sid.toString(), departures: departures.slice(0, 40), lines }
+      const stop_detail = {
+        stop_id: sid.toString(),
+        name: stopName,
+        api_timestamp_ms: Number.isFinite(apiTimestamp) ? apiTimestamp : null,
+        ramp_ko_count: rampKO.length,
+        ramp_ko_examples: rampKO.slice(0, 2),
+      }
+
+      return {
+        stop_id: sid.toString(),
+        departures: departures.slice(0, 40),
+        lines,
+        stop_detail,
+      }
     }
 
-    const stops = [await fetchStop(stopId)]
+    const stops = []
+    stops.push(await fetchStop(stopId))
     if (secondaryStopId) stops.push(await fetchStop(secondaryStopId))
 
     res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=45")
