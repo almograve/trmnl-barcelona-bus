@@ -29,15 +29,36 @@ export default async function handler(req, res) {
           return { stop_id: sid, error: `TMB error ${r.status}`, departures: [] }
         }
 
-        const data = await r.json()
+        const payload = await r.json()
 
-        const departures = (data?.data?.ibus || [])
+        // TMB responses sometimes vary in shape, try a few paths
+        const ibus =
+          payload?.data?.ibus ??
+          payload?.data?.["ibus"] ??
+          payload?.data?.["iBus"] ??
+          payload?.data?.["i-bus"] ??
+          payload?.ibus ??
+          []
+
+        const departures = (Array.isArray(ibus) ? ibus : [])
           .slice(0, 6)
-          .map((d) => ({
-            line: d?.line || "",
-            destination: d?.destination || "",
-            minutes: Number.isFinite(Number(d?.t_in_min)) ? Number(d.t_in_min) : null,
-          }))
+          .map((d) => {
+            const rawMinutes =
+              d?.t_in_min ??
+              d?.["t-in-min"] ??
+              d?.t_in_minute ??
+              d?.["t-in-minute"] ??
+              d?.minutes ??
+              d?.["minutes"]
+
+            const minutes = Number.isFinite(Number(rawMinutes)) ? Number(rawMinutes) : null
+
+            return {
+              line: (d?.line || "").toString(),
+              destination: (d?.destination || "").toString(),
+              minutes,
+            }
+          })
           .filter((d) => d.line && d.destination)
 
         return { stop_id: sid, departures }
@@ -51,7 +72,7 @@ export default async function handler(req, res) {
       updated_at: new Date().toISOString(),
       stops: results,
     })
-  } catch {
+  } catch (e) {
     return res.status(500).json({ error: "Unexpected error" })
   }
 }
